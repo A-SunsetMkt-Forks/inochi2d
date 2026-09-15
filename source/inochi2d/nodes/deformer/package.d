@@ -212,24 +212,3 @@ public:
 }
 
 mixin Register!(Deformer, in_node_registry);
-
-/**
-    A deformer look-up-table for a deformer-to-mesh
-    mapping.
-*/
-struct DeformerLUT(alias mapfn) {
-@nogc:
-
-    /**
-        LUT entries
-    */
-    ptrdiff_t[2][] entries;
-
-    /**
-        Rebuilds the LUT.
-    */
-    void rebuild(Parameters!(mapfn) params) {
-        nu_freea(entries);
-        entries = mapfn(params);
-    }
-}

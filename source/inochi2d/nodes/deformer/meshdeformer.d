@@ -22,42 +22,6 @@ import numem;
 import inochi2d.core.math.simd;
 import inteli;
 
-alias MeshDeformerLUT = DeformerLUT!((DeformedMesh src, IDeformable target) @nogc {
-    ptrdiff_t[2][] mappings = nu_malloca!(ptrdiff_t[2])(target.deformPoints.length);
-    foreach (j; 0 .. mappings.length) {
-        vec2 mp = target.deformPoints[j];
-
-        mappings[j] = [-1, -1];
-        foreach (k; 0 .. src.elementCount / 3) {
-            uint[3] idx = [
-                src.indices[(k * 3) + 0],
-                src.indices[(k * 3) + 1],
-                src.indices[(k * 3) + 2],
-            ];
-            Triangle tri = Triangle(
-                src.points[idx[0]],
-                src.points[idx[1]],
-                src.points[idx[2]],
-            );
-
-            // Do some cheaper checks first.
-            float minX = min(min(tri.p1.x, tri.p2.x), tri.p3.x);
-            float maxX = max(max(tri.p1.x, tri.p2.x), tri.p3.x);
-            float minY = min(min(tri.p1.y, tri.p2.y), tri.p3.y);
-            float maxY = max(max(tri.p1.y, tri.p2.y), tri.p3.y);
-            if (!(minX < mp.x && maxX > mp.x) &&
-                !(minY < mp.y && maxY > mp.y))
-                continue;
-
-            // Mapping found, add it!
-            mappings[j] = [k * 3, j];
-            break;
-        }
-    }
-
-    return mappings;
-});
-
 /**
     A deformer which deforms child nodes stored within it,
 */
@@ -68,11 +32,7 @@ private:
     Mesh mesh_;
     DeformedMesh base_;
     DeformedMesh deformed_;
-    vec2[] deformDeltas_;
-
-    // Accelleration structures
-    MeshDeformerLUT[] luts_;
-    vec2[] deformBuffer_;
+    MeshDeformerShape shape_;
 
 protected:
 
@@ -83,7 +43,7 @@ protected:
             object =    The DataNode to serialize to.
     */
     override
-    void onSerialize(ref DataNode object) {
+    void onSerialize(ref DataNode object) @nogc {
         super.onSerialize(object);
 
         // NOTE:    MeshData is set up to free its contents on
@@ -100,7 +60,7 @@ protected:
             state =     The state of the deserializer.
     */
     override
-    void onDeserialize(ref DataNode object, ref ModelState state) {
+    void onDeserialize(ref DataNode object, ref ModelState state) @nogc {
         super.onDeserialize(object, state);
 
         this.deformed_ = nogc_new!DeformedMesh();
@@ -124,7 +84,7 @@ protected:
             drawList =  The drawlist for the active scene.
     */
     override
-    void onPreUpdate(DrawList drawList) {
+    void onPreUpdate(DrawList drawList) @nogc {
         super.onPreUpdate(drawList);
         this.resetDeform();
     }
@@ -137,9 +97,11 @@ protected:
             drawList =  The drawlist for the active scene.
     */
     override
-    void onUpdate(float delta, DrawList drawList) {
+    void onUpdate(float delta, DrawList drawList) @nogc {
         base_.pushMatrix(this.deformMatrix);
         deformed_.pushMatrix(this.deformMatrix);
+        shape_.update(base_.points, deformed_.points);
+
         super.onUpdate(delta, drawList);
     }
 
@@ -150,51 +112,20 @@ protected:
             drawList =  The drawlist for the active scene.
     */
     override
-    void onPostUpdate(DrawList drawList) {
+    void onPostUpdate(DrawList drawList) @nogc {
+        super.onPostUpdate(drawList);
 
-        // No deltas?
-        if (deformDeltas_.length == 0) {
+        // Not ready?
+        if (!shape_.isReady) {
             super.onPostUpdate(drawList);
             return;
         }
 
+
         // Calculate the deltas from the world matrix.
-        simd_meshcopy(deformDeltas_, base_.points);
-        simd_sub(deformDeltas_, deformed_.points);
         foreach (i, mesh; toDeform) {
-            size_t w_length = nu_min(deformBuffer_.length, mesh.deformPoints.length);
-            deformBuffer_[0 .. w_length] = vec2(0, 0);
-
-            // Setup temporary buffer.
-            foreach (entry; luts_[i].entries) {
-
-                // Skip vertices out of bounds.
-                if (entry[0] < 0 || entry[1] < 0 || entry[1] >= w_length)
-                    continue;
-
-                size_t p0 = mesh_.indices[entry[0] + 0];
-                size_t p1 = mesh_.indices[entry[0] + 1];
-                size_t p2 = mesh_.indices[entry[0] + 2];
-
-                // Build triangle from start index.
-                Triangle tri = Triangle(
-                        deformed_.points[p0],
-                        deformed_.points[p1],
-                        deformed_.points[p2],
-                );
-
-                vec3 bc = tri.barycentric(mesh.deformPoints[entry[1]]);
-                deformBuffer_[entry[1]] = -(
-                        (deformDeltas_[p0] * bc.x) +
-                        (deformDeltas_[p1] * bc.y) +
-                        (deformDeltas_[p2] * bc.z)
-                );
-            }
-
-            mesh.deform(deformBuffer_[0 .. w_length]);
+            shape_.deformMesh(mesh);
         }
-
-        super.onPostUpdate(drawList);
     }
 
     /**
@@ -202,22 +133,8 @@ protected:
         rebuilt.
     */
     override
-    void onRebuild() {
+    void onRebuild() @nogc {
         super.onRebuild();
-
-        // Delete old LUTs
-        if (luts_)
-            nu_freea(luts_);
-
-        // Find children and rebuild.
-        this.luts_ = nu_malloca!MeshDeformerLUT(toDeform.length);
-        foreach (i, target; toDeform) {
-            luts_[i].rebuild(deformed_, target);
-
-            // Resize temporary deformation buffer.
-            if (target.deformPoints.length > deformBuffer_.length)
-                deformBuffer_ = deformBuffer_.nu_resize(target.deformPoints.length);
-        }
     }
 
 public:
@@ -234,7 +151,7 @@ public:
             mesh_.release();
 
         this.mesh_ = value.retained();
-        this.deformDeltas_ = deformDeltas_.nu_resize(mesh_.vertexCount);
+        this.shape_.setMesh(mesh_);
 
         this.base_.parent = value;
         this.deformed_.parent = value;
@@ -242,6 +159,11 @@ public:
         this.base_.reset();
         this.base_.pushMatrix(this.deformBaseMatrix);
     }
+
+    /**
+        The underlying shape data of the deformer.
+    */
+    @property ref MeshDeformerShape shape() @nogc => shape_;
 
     /**
         The control points of the deformer.
@@ -266,7 +188,7 @@ public:
 
     // Destructor
     ~this() {
-        nu_freea(deformDeltas_);
+        nogc_delete(shape_);
         nogc_delete(deformed_);
         nogc_delete(base_);
         mesh_.release();
@@ -275,7 +197,7 @@ public:
     /**
         Constructs a new MeshGroup node
     */
-    this(Node parent = null) {
+    this(Node parent = null) @nogc {
         super(parent);
     }
 
@@ -288,7 +210,7 @@ public:
                         replacing the original deformation.
     */
     override
-    void deform(vec2[] deformed, bool absolute = false) {
+    void deform(vec2[] deformed, bool absolute = false) @nogc {
         deformed_.deform(deformed);
     }
 
@@ -296,10 +218,134 @@ public:
         Resets the deformation for the IDeformable.
     */
     override
-    void resetDeform() {
+    void resetDeform() @nogc {
         deformed_.reset();
         base_.reset();
     }
 }
 
 mixin Register!(MeshDeformer, in_node_registry);
+
+/**
+    A managed type handling the shape of a mesh deformer's vertices.
+*/
+struct MeshDeformerShape {
+private:
+@nogc:
+    vec2[] deltas;
+    vec2[] tmp;
+
+    vec2 getDeformDelta(vec2 p) {
+        for(size_t i = 0; i < indices.length; i += 3) {
+
+            uint i0 = indices[i + 0];
+            uint i1 = indices[i + 1];
+            uint i2 = indices[i + 2];
+
+            vec2 p0 = vertices[i0];
+            vec2 p1 = vertices[i1];
+            vec2 p2 = vertices[i2];
+
+            // Do some cheaper checks first.
+            float minX = min(min(p0.x, p1.x), p2.x);
+            float maxX = max(max(p0.x, p1.x), p2.x);
+            float minY = min(min(p0.y, p1.y), p2.y);
+            float maxY = max(max(p0.y, p1.y), p2.y);
+            if (!(minX < p.x && maxX > p.x) &&
+                !(minY < p.y && maxY > p.y))
+                continue;
+
+            Triangle tri = Triangle(p0, p1, p2);
+            if (tri.contains(p)) {
+                vec3 bc = tri.barycentric(p);
+                vec2 d0 = deltas[i0]*bc.x;
+                vec2 d1 = deltas[i1]*bc.y;
+                vec2 d2 = deltas[i2]*bc.z;
+                return -(d0+d1+d2);
+            }
+        }
+        return vec2(0, 0);
+    }
+
+public:
+
+    /**
+        Indices of the shape.
+    */
+    uint[] indices;
+    
+    /**
+        Vertices of the shape.
+    */
+    vec2[] vertices;
+
+    /**
+        Whether the shape is ready for use.
+    */
+    @property bool isReady() => deltas.length > 0;
+
+    /**
+        Axis aligned bounding box encompassing the vertices.
+    */
+    rect aabb;
+
+    /// Destructor
+    ~this() {
+        nu_freea(indices);
+        nu_freea(vertices);
+        nu_freea(deltas);
+        nu_freea(tmp);
+    }
+
+    /**
+        Sets the mesh of the deformer shape.
+    */
+    void setMesh(Mesh mesh) {
+        if (indices.length != mesh.indices.length) {
+            indices = indices.nu_resize(mesh.indices.length);
+        }
+
+        if (vertices.length != mesh.vertices.length) {
+            vertices = vertices.nu_resize(mesh.vertices.length);
+            deltas = deltas.nu_resize(mesh.vertices.length);
+        }
+
+        simd_meshcopy(indices, mesh.indices);
+        simd_meshcopy(vertices, mesh.points);
+    }
+
+    /**
+        Updates the mesh deformer shape with the given deformed
+        vertices.
+    */
+    void update(vec2[] base, vec2[] deformed) {
+        assert(vertices.length == base.length);
+
+        simd_meshcopy(vertices, base);
+        simd_meshcopy(deltas, base);
+        simd_sub(deltas, deformed);
+        simd_aabb(aabb, base);
+    }
+
+    /**
+        Deforms the given mesh using this shape.
+    */
+    void deformMesh(IDeformable mesh) {
+        size_t w_length = mesh.deformPoints.length;
+
+        // Prepare temporary buffer.
+        if (w_length > tmp.length) 
+            tmp = tmp.nu_resize(w_length);
+        tmp[0..w_length] = vec2(0, 0);
+        
+        // Calculate the deformation needed by each vertex
+        // in the mesh.
+        foreach(i; 0..w_length) {
+
+            vec2 delta = getDeformDelta(mesh.deformPoints[i]);
+            if (delta != vec2.init)
+                tmp[i] = delta;
+        }
+        mesh.deform(tmp[0..w_length], false);
+    }
+}

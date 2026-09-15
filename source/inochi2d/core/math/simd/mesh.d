@@ -304,3 +304,47 @@ if (is(T == VectorImpl!U, U...) && T.dimensions == 2) {
         }
     }
 }
+
+/**
+    Calculates an axis-aligned bounding box which encapsulates
+    the given mesh.
+
+    Params:
+        dst =   The rectangle to store the AABB within.
+        mesh =  The mesh to get the AABB for.
+*/
+void simd_aabb(T)(ref rect dst, T[] mesh) @nogc nothrow
+if (is(T == VectorImpl!U, U...) && T.dimensions == 2) {
+    size_t w_length = mesh.length;
+    vec2 v_min = float.max;
+    vec2 v_max = -float.max;
+
+    // NOTE:    SSE version of the algorithm.
+    //          This algorithm loads 128 bits of mesh data at a time, then deforms it.
+    //          Value is stored unaligned to memory.
+
+    static if (!SSESizedVectorsAreEmulated) {
+        __m128 m_min = __m128([float.max, float.max, float.max, float.max]);
+        __m128 m_max = __m128([-float.max, -float.max, -float.max, -float.max]);
+    
+        // SIMD version
+        size_t i = 0;
+        for (; i < nu_aligndown(w_length, 2); i += 2) {
+            __m128 xyzw = _mm_loadu_ps(cast(const(float)*)&mesh[i]);
+            m_min = _mm_min_ps(m_min, xyzw);
+            m_max = _mm_max_ps(m_max, xyzw);
+        }
+        v_min = min(vec2(m_min[0], m_min[1]), vec2(m_min[2], m_min[3]));
+        v_max = max(vec2(m_max[0], m_max[1]), vec2(m_max[2], m_max[3]));
+    }
+
+    // Tail iteration
+    for (; i < w_length; i++) {
+        v_min = min(v_min, mesh[i]);
+        v_max = max(v_max, mesh[i]);
+    }
+    dst.x = v_min.x;
+    dst.y = v_min.y;
+    dst.width = v_max.x - v_min.x;
+    dst.height = v_max.y - v_min.y;
+}
